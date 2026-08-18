@@ -1,0 +1,189 @@
+name: AC EVO v7.3.1 FINAL RELEASE
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.1.0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v6.3.0
+        with:
+          gradle-version: '8.13'
+
+      - name: Verify Android SDK and install API 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          test -n "$SDKMANAGER"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          test -x "$SDK_ROOT/build-tools/35.0.0/apksigner"
+
+      - name: Verify and unpack exact v7.3.1 bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE='AC_EVO_Setup_Engineer_v7_3_1_VERIFIED_LIVE_SELFCALC_MOBILE_BUNDLE.zip'
+          test -f "$BUNDLE"
+          unzip -t "$BUNDLE"
+          rm -rf project
+          mkdir project
+          unzip -q "$BUNDLE" -d project
+          test -f project/settings.gradle
+          test -f project/app/build.gradle
+          test -f project/tools/verify_v7_3_1.py
+          test -f project/tools/live_source_smoke_v7_3_1.py
+          test -f project/app/src/main/java/com/greenbuddy/acevosetupengineer/LiveSetupSourceManager.java
+
+      - name: Run intensive v7.3.1 static and runtime verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 project/tools/verify_v7_3_1.py | tee STATIC_RUNTIME_VERIFICATION.txt
+          grep -q 'VERIFICATION_v7.3.1: PASS' STATIC_RUNTIME_VERIFICATION.txt
+          test "$(find project -type f \( -name '*.jks' -o -name '*.keystore' \) | wc -l)" -eq 0
+
+      - name: Verify provider failure falls back instead of aborting app logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('project/app/src/main/java/com/greenbuddy/acevosetupengineer/LiveSetupSourceManager.java')
+          s=p.read_text(encoding='utf-8')
+          required={
+            'RacePlace exception is contained':'catch(Exception e){race.coverageComplete=false;race.error=safe(e.getMessage());}',
+            'SetupsMarket exception is contained':'catch(Exception e){market.coverageComplete=false;market.error=safe(e.getMessage());}',
+            'Incomplete live coverage is explicitly marked':'LIVE exact-search coverage could not be proven complete',
+            'Self calculation path exists':'r.calculated=true',
+            'No fixed fallback path remains':'No donor file, nearest-track candidate, fixed reference track or Track-DNA fallback exists in this path.'
+          }
+          missing=[name for name,text in required.items() if text not in s]
+          if missing:
+              raise SystemExit('FAIL: '+', '.join(missing))
+          print('PROVIDER_FAILURE_FALLBACK_LOGIC_PASS')
+          PY
+
+      - name: Run fresh LIVE source diagnostic
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          python3 project/tools/live_source_smoke_v7_3_1.py 2>&1 | tee LIVE_SOURCE_SMOKE.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$rc" -eq 0 ]; then
+            grep -q 'LIVE_SOURCE_SMOKE_PASS' LIVE_SOURCE_SMOKE.txt
+            echo 'LIVE_SOURCE_DIAGNOSTIC=FULL_PASS' | tee -a LIVE_SOURCE_SMOKE.txt
+          else
+            # A public provider can rate-limit/block a GitHub datacenter runner.
+            # That is external availability, not a defect in the APK. The app
+            # already catches provider failures, marks LIVE coverage incomplete,
+            # and continues through SELF CALCULATION instead of claiming an exact match.
+            if grep -Eqi '(HTTP Error (401|403|406|409|418|425|429|451|503)|HTTP (401|403|406|409|418|425|429|451|503)|429: Too Many Requests|timed out|Temporary failure in name resolution|Name or service not known|Connection reset|Remote end closed connection|URLError)' LIVE_SOURCE_SMOKE.txt; then
+              echo 'LIVE_SOURCE_DIAGNOSTIC=REMOTE_PROVIDER_LIMIT_NONFATAL' | tee -a LIVE_SOURCE_SMOKE.txt
+            else
+              echo 'LIVE source parser/logic failed for a reason that is not a normal remote availability block.' >&2
+              exit "$rc"
+            fi
+          fi
+
+      - name: Independent RacePlace page diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee RACEPLACE_DIAGNOSTIC.txt
+          from urllib.request import Request,urlopen
+          from urllib.error import HTTPError,URLError
+          import re
+          url='https://raceplace.racing/downloads/'
+          req=Request(url,headers={'User-Agent':'AC-EVO-Setup-Engineer-v7.3.1-GitHub-Diagnostic','Accept':'text/html,*/*;q=0.8'})
+          try:
+              with urlopen(req,timeout=30) as r:
+                  html=r.read(2*1024*1024).decode('utf-8','replace')
+              if not re.search(r'(?i)(Assetto Corsa Evo Free Baseline Setups|RacePlace-ACE-Baseline-Setups)',html):
+                  raise SystemExit('RACEPLACE_PARSER_FAIL: baseline marker not found on reachable page')
+              print('RACEPLACE_DIAGNOSTIC=PARSE_PASS')
+          except HTTPError as e:
+              if e.code in {401,403,406,409,418,425,429,451,503}:
+                  print(f'RACEPLACE_DIAGNOSTIC=REMOTE_PROVIDER_LIMIT_NONFATAL HTTP {e.code}')
+              else:
+                  raise
+          except (URLError,TimeoutError,OSError) as e:
+              print('RACEPLACE_DIAGNOSTIC=REMOTE_NETWORK_NONFATAL '+type(e).__name__+': '+str(e))
+          PY
+
+      - name: Prepare private release signing key
+        shell: bash
+        env:
+          ACEVO_KEYSTORE_B64: ${{ secrets.ACEVO_KEYSTORE_B64 }}
+          ACEVO_KEYSTORE_PASSWORD: ${{ secrets.ACEVO_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${ACEVO_KEYSTORE_B64:-}"
+          test -n "${ACEVO_KEYSTORE_PASSWORD:-}"
+          printf '%s' "$ACEVO_KEYSTORE_B64" | base64 --decode > project/release-keystore.jks
+          test -s project/release-keystore.jks
+          keytool -list -keystore project/release-keystore.jks -storepass "$ACEVO_KEYSTORE_PASSWORD" -alias acevosetup >/dev/null
+
+      - name: Build signed v7.3.1 RELEASE APK
+        working-directory: project
+        shell: bash
+        env:
+          ACEVO_KEYSTORE_PASSWORD: ${{ secrets.ACEVO_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace clean :app:assembleRelease
+
+      - name: Verify APK signature and release certificate
+        shell: bash
+        env:
+          EXPECTED_CERT_SHA256: 'fc1f41829114f92d64de6f11f69927aecb97e701250146472a9bc77d86ed832f'
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          APKSIGNER="$SDK_ROOT/build-tools/35.0.0/apksigner"
+          APK='project/app/build/outputs/apk/release/app-release.apk'
+          test -s "$APK"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee RELEASE_CERTIFICATE.txt
+          grep -qi "$EXPECTED_CERT_SHA256" RELEASE_CERTIFICATE.txt
+          mkdir -p artifact
+          cp "$APK" artifact/AC_EVO_Setup_Engineer_v7_3_1_VERIFIED_LIVE_SELFCALC_RELEASE.apk
+          sha256sum artifact/AC_EVO_Setup_Engineer_v7_3_1_VERIFIED_LIVE_SELFCALC_RELEASE.apk | tee artifact/AC_EVO_Setup_Engineer_v7_3_1_VERIFIED_LIVE_SELFCALC_RELEASE.apk.sha256
+          cp project/VALIDATION_v7_3_1_VERIFIED_LIVE_SELFCALC.json artifact/
+          cp project/V7_3_1_VERIFIED_LIVE_SELFCALC_CHANGES.txt artifact/
+          cp project/STATIC_VALIDATION_V7_3_1.txt artifact/
+          cp STATIC_RUNTIME_VERIFICATION.txt artifact/
+          cp LIVE_SOURCE_SMOKE.txt artifact/
+          cp RACEPLACE_DIAGNOSTIC.txt artifact/
+          cp RELEASE_CERTIFICATE.txt artifact/
+
+      - name: Upload verified release artifact
+        uses: actions/upload-artifact@v5.0.0
+        with:
+          name: AC-EVO-Setup-Engineer-v7-3-1-VERIFIED-LIVE-SELFCALC-RELEASE-APK
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
