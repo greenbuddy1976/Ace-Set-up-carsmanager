@@ -1,0 +1,136 @@
+name: Build The Godfather of EVO v8.0.0 RELEASE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'The_Godfather_of_EVO_v8_0_0_GITHUB_MOBILE_BUNDLE.zip'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.13'
+          cache-provider: basic
+
+      - name: Install and verify Android SDK API 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager || true)"; fi
+          test -n "$SDKMANAGER"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          test -x "$SDK_ROOT/build-tools/35.0.0/apksigner"
+          java -version
+          gradle --version
+
+      - name: Verify exact uploaded source bundle
+        shell: bash
+        env:
+          EXPECTED_BUNDLE_SHA256: 'c76268faaee69ba4fa865c7379169882308c38fd596e72d6d6009ea03116fc47'
+        run: |
+          set -euo pipefail
+          BUNDLE='The_Godfather_of_EVO_v8_0_0_GITHUB_MOBILE_BUNDLE.zip'
+          test -s "$BUNDLE"
+          echo "$EXPECTED_BUNDLE_SHA256  $BUNDLE" | sha256sum -c -
+          unzip -t "$BUNDLE"
+          rm -rf project
+          mkdir project
+          unzip -q "$BUNDLE" -d project
+          test -f project/settings.gradle
+          test -f project/app/build.gradle
+          test -f project/tools/verify_godfather.py
+          test -f project/VALIDATION_GODFATHER_V8.json
+          test -f project/THE_GODFATHER_OF_EVO_CHANGES.txt
+
+      - name: Run full Godfather verification gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 project/tools/verify_godfather.py | tee STATIC_RUNTIME_VERIFICATION.txt
+          grep -q '^VERIFICATION_GODFATHER: PASS$' STATIC_RUNTIME_VERIFICATION.txt
+          grep -q '^GODFATHER_RUNTIME_MATRIX_PASS=864/864$' STATIC_RUNTIME_VERIFICATION.txt
+          grep -q '^LIVE_GATE=3_COMPLETE_ATTEMPTS$' STATIC_RUNTIME_VERIFICATION.txt
+          grep -q '^OLD_SETUP_VALUE_RUNTIME_FALLBACKS=ABSENT$' STATIC_RUNTIME_VERIFICATION.txt
+          test "$(find project -type f \( -name '*.jks' -o -name '*.keystore' \) | wc -l)" -eq 0
+          test "$(find project -type f -name '*.carsetup' | wc -l)" -eq 6
+          test "$(find project/app/src/main/assets/structure_templates -type f -name '*.carsetup' | wc -l)" -eq 6
+
+      - name: Prepare private release signing key
+        shell: bash
+        env:
+          ACEVO_KEYSTORE_B64: ${{ secrets.ACEVO_KEYSTORE_B64 }}
+          ACEVO_KEYSTORE_PASSWORD: ${{ secrets.ACEVO_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${ACEVO_KEYSTORE_B64:-}"
+          test -n "${ACEVO_KEYSTORE_PASSWORD:-}"
+          printf '%s' "$ACEVO_KEYSTORE_B64" | base64 --decode > project/release-keystore.jks
+          test -s project/release-keystore.jks
+          keytool -list -keystore project/release-keystore.jks -storepass "$ACEVO_KEYSTORE_PASSWORD" -alias acevosetup >/dev/null
+
+      - name: Build signed release APK
+        working-directory: project
+        shell: bash
+        env:
+          ACEVO_KEYSTORE_PASSWORD: ${{ secrets.ACEVO_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace clean :app:assembleRelease
+
+      - name: Verify APK signature and release certificate
+        shell: bash
+        env:
+          EXPECTED_CERT_SHA256: 'fc1f41829114f92d64de6f11f69927aecb97e701250146472a9bc77d86ed832f'
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          APKSIGNER="$SDK_ROOT/build-tools/35.0.0/apksigner"
+          APK='project/app/build/outputs/apk/release/app-release.apk'
+          test -s "$APK"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee RELEASE_CERTIFICATE.txt
+          grep -qi "$EXPECTED_CERT_SHA256" RELEASE_CERTIFICATE.txt
+
+          mkdir -p artifact
+          OUT='artifact/The_Godfather_of_EVO_v8_0_0_RELEASE.apk'
+          cp "$APK" "$OUT"
+          sha256sum "$OUT" | tee artifact/The_Godfather_of_EVO_v8_0_0_RELEASE.apk.sha256
+          cp project/VALIDATION_GODFATHER_V8.json artifact/
+          cp project/THE_GODFATHER_OF_EVO_CHANGES.txt artifact/
+          cp project/STATIC_VALIDATION_GODFATHER.txt artifact/
+          cp STATIC_RUNTIME_VERIFICATION.txt artifact/
+          cp RELEASE_CERTIFICATE.txt artifact/
+          printf '%s\n' 'The Godfather of EVO v8.0.0' '© Greenbuddy1976' > artifact/RELEASE_IDENTITY.txt
+          ls -lh artifact/
+
+      - name: Upload verified release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: The-Godfather-of-EVO-v8-0-0-RELEASE
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
